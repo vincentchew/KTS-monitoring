@@ -477,7 +477,15 @@ def save_alerted(keys: set[str]) -> None:
     )
 
 
-def send_telegram(cfg: Config, text: str) -> None:
+def _html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def send_telegram(cfg: Config, text: str, *, parse_mode: str = "HTML") -> None:
     if cfg.dry_run:
         # Keep dry-run output free of secrets; message body is intentional for local debug.
         print("DRY_RUN telegram message:")
@@ -506,13 +514,14 @@ def send_telegram(cfg: Config, text: str) -> None:
 
     url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
     for chunk in chunks:
-        body = urllib.parse.urlencode(
-            {
-                "chat_id": cfg.telegram_chat_id,
-                "text": chunk,
-                "disable_web_page_preview": "true",
-            }
-        ).encode()
+        payload = {
+            "chat_id": cfg.telegram_chat_id,
+            "text": chunk,
+            "disable_web_page_preview": "true",
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        body = urllib.parse.urlencode(payload).encode()
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         try:
@@ -533,21 +542,73 @@ def send_telegram(cfg: Config, text: str) -> None:
             raise RuntimeError(f"Telegram API error: {desc}")
 
 
+def _pretty_date(iso: str) -> str:
+    """2026-08-09 → 9 Aug 2026"""
+    try:
+        d = date.fromisoformat(iso)
+        return f"{d.day} {d.strftime('%b %Y')}"
+    except ValueError:
+        return iso
+
+
 def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
-    lines = [
-        "KTMB seats available",
-        f"Passengers: {cfg.passenger_count}",
-        "",
+    """
+    Compact, scannable HTML for Telegram.
+
+    Example:
+      🚂 KTMB seats available
+      Pax: 1
+
+      ➡️ OUT · 9 Aug 2026
+      JB SENTRAL → KL SENTRAL
+      <pre>07:35–12:11  Gold 9442       25  RM 84
+      08:40–13:00  Platinum 9524   42  RM 113</pre>
+    """
+    lines: list[str] = [
+        "🚂 <b>KTMB seats available</b>",
+        f"Pax: {cfg.passenger_count}",
     ]
+
+    # leg → date → trips
+    order = ("outbound", "return")
+    by_leg: dict[str, dict[str, list[Trip]]] = {k: {} for k in order}
     for t in new_trips:
-        tag = "OUT" if t.leg == "outbound" else "RET"
-        lines.append(
-            f"• [{tag}] {t.from_label} → {t.to_label}\n"
-            f"  {t.date}  {t.depart}–{t.arrive}  "
-            f"{t.service} {t.train_no}  "
-            f"{t.seats} seat(s)  MYR {t.fare}"
-        )
-    lines += ["", BASE]
+        by_leg.setdefault(t.leg, {}).setdefault(t.date, []).append(t)
+
+    for leg in order:
+        dates = by_leg.get(leg) or {}
+        if not dates:
+            continue
+        tag = "➡️ OUT" if leg == "outbound" else "⬅️ RET"
+        for day in sorted(dates.keys()):
+            trips = sorted(dates[day], key=lambda x: (x.depart, x.train_no))
+            sample = trips[0]
+            route = (
+                f"{_html_escape(sample.from_label)} → "
+                f"{_html_escape(sample.to_label)}"
+            )
+            lines.append("")
+            lines.append(f"{tag} · <b>{_html_escape(_pretty_date(day))}</b>")
+            lines.append(route)
+
+            # Monospace block keeps columns readable on mobile
+            table_lines: list[str] = []
+            for t in trips:
+                # Fixed-ish columns: time, service+no, seats, fare
+                left = f"{t.depart}–{t.arrive}"
+                mid = f"{t.service} {t.train_no}"
+                seats = f"{t.seats} seat"
+                if t.seats != 1:
+                    seats += "s"
+                fare = f"RM {t.fare}"
+                # Pad mid for rough alignment inside <pre>
+                table_lines.append(
+                    f"{left}  {mid:<18}  {seats:>9}  {fare}"
+                )
+            block = _html_escape("\n".join(table_lines))
+            lines.append(f"<pre>{block}</pre>")
+
+    lines += ["", f'<a href="{BASE}">Book on KTMB</a>']
     return "\n".join(lines)
 
 

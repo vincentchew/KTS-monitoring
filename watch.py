@@ -551,38 +551,24 @@ def _pretty_date(iso: str) -> str:
         return iso
 
 
-def _short_service(name: str) -> str:
-    """Shorter class labels for narrow phone screens."""
-    key = name.strip().lower()
-    mapping = {
-        "platinum": "Plat",
-        "gold": "Gold",
-        "silver": "Silv",
-        "business": "Biz",
-        "economy": "Econ",
-    }
-    return mapping.get(key, name)
-
-
 def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
     """
-    Phone-first HTML for Telegram (no wide <pre> columns).
+    Previous sectioned layout, phone-friendly:
 
-    Example:
-      🚂 KTMB seats
+      🚂 KTMB seats available
       Pax: 1
 
       ➡️ OUT · 9 Aug 2026
       JB SENTRAL → KL SENTRAL
 
-      <b>07:35</b> Gold 9442
+      07:35–12:11  Gold 9442
       25 seats · RM 84
 
-      <b>08:40</b> Plat 9524
+      08:40–13:00  Platinum 9524
       42 seats · RM 113
     """
     lines: list[str] = [
-        "🚂 <b>KTMB seats</b>",
+        "🚂 <b>KTMB seats available</b>",
         f"Pax: {cfg.passenger_count}",
     ]
 
@@ -606,21 +592,21 @@ def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
             )
             lines.append("")
             lines.append(f"{tag} · <b>{_html_escape(_pretty_date(day))}</b>")
-            lines.append(f"<i>{route}</i>")
+            lines.append(route)
 
             for t in trips:
-                svc = _html_escape(_short_service(t.service))
+                svc = _html_escape(t.service)
                 train = _html_escape(t.train_no)
-                # Drop .00 on whole-ringgit fares: 84.00 → 84
                 fare = t.fare
                 if fare.endswith(".00"):
                     fare = fare[:-3]
                 fare = _html_escape(fare)
                 seats_word = "seat" if t.seats == 1 else "seats"
+                # Blank line before each train block for spacing
                 lines.append("")
                 lines.append(
-                    f"<b>{_html_escape(t.depart)}</b>–"
-                    f"{_html_escape(t.arrive)} · {svc} {train}"
+                    f"<b>{_html_escape(t.depart)}–{_html_escape(t.arrive)}</b>"
+                    f"  {svc} {train}"
                 )
                 lines.append(f"{t.seats} {seats_word} · RM {fare}")
 

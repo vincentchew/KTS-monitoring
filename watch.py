@@ -19,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Iterable
@@ -459,20 +459,39 @@ def filter_trips(
     return out
 
 
-def load_alerted() -> set[str]:
+def load_state() -> dict:
+    """
+    State file shape:
+      {
+        "alerted": ["outbound|2026-08-09|9442|07:35", ...],
+        "last_heartbeat_date": "2026-07-24"  # UTC YYYY-MM-DD
+      }
+    """
     if not STATE_PATH.exists():
-        return set()
+        return {"alerted": [], "last_heartbeat_date": None}
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        return set(data.get("alerted") or [])
+        if not isinstance(data, dict):
+            return {"alerted": [], "last_heartbeat_date": None}
+        return {
+            "alerted": list(data.get("alerted") or []),
+            "last_heartbeat_date": data.get("last_heartbeat_date"),
+        }
     except (OSError, json.JSONDecodeError):
-        return set()
+        return {"alerted": [], "last_heartbeat_date": None}
 
 
-def save_alerted(keys: set[str]) -> None:
+def save_state(alerted: set[str], last_heartbeat_date: str | None) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(
-        json.dumps({"alerted": sorted(keys)}, indent=2) + "\n",
+        json.dumps(
+            {
+                "alerted": sorted(alerted),
+                "last_heartbeat_date": last_heartbeat_date,
+            },
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -713,7 +732,9 @@ def main() -> int:
                 print(f"poll error on one leg/date: {leg}", file=sys.stderr)
 
     current_keys = {t.key for t in all_matches}
-    alerted = load_alerted()
+    state = load_state()
+    alerted = set(state["alerted"])
+    last_heartbeat = state.get("last_heartbeat_date")
     # Drop keys that are no longer available so they can re-alert later
     alerted &= current_keys
     new_keys = current_keys - alerted
@@ -729,20 +750,43 @@ def main() -> int:
         f"errors={errors}"
     )
 
+    # Hard failure if every date/leg poll failed
+    if checks and errors == checks:
+        save_state(alerted, last_heartbeat)
+        return 1
+
+    # Seat alert (new availability)
     if new_trips:
         msg = format_alert(cfg, new_trips)
         try:
             send_telegram(cfg, msg)
-            print("telegram=sent")
+            print("telegram=seat_alert")
         except Exception as e:
             print(f"telegram error: {e}", file=sys.stderr)
+            save_state(alerted, last_heartbeat)
             return 1
         alerted |= new_keys
 
-    save_alerted(alerted)
+    # Daily heartbeat (UTC): once per successful day, no route/date details
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if last_heartbeat != today_utc:
+        hb = (
+            "💓 <b>KTS watcher OK</b>\n"
+            f"Checked {checks} · matches {len(all_matches)} · errors {errors}\n"
+            "Still monitoring."
+        )
+        try:
+            send_telegram(cfg, hb)
+            print("telegram=heartbeat")
+            last_heartbeat = today_utc
+        except Exception as e:
+            print(f"telegram error: {e}", file=sys.stderr)
+            save_state(alerted, last_heartbeat)
+            return 1
+    else:
+        print("heartbeat=skipped")
 
-    if checks and errors == checks:
-        return 1
+    save_state(alerted, last_heartbeat)
     return 0
 
 

@@ -551,21 +551,38 @@ def _pretty_date(iso: str) -> str:
         return iso
 
 
+def _short_service(name: str) -> str:
+    """Shorter class labels for narrow phone screens."""
+    key = name.strip().lower()
+    mapping = {
+        "platinum": "Plat",
+        "gold": "Gold",
+        "silver": "Silv",
+        "business": "Biz",
+        "economy": "Econ",
+    }
+    return mapping.get(key, name)
+
+
 def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
     """
-    Compact, scannable HTML for Telegram.
+    Phone-first HTML for Telegram (no wide <pre> columns).
 
     Example:
-      🚂 KTMB seats available
+      🚂 KTMB seats
       Pax: 1
 
       ➡️ OUT · 9 Aug 2026
       JB SENTRAL → KL SENTRAL
-      <pre>07:35–12:11  Gold 9442       25  RM 84
-      08:40–13:00  Platinum 9524   42  RM 113</pre>
+
+      <b>07:35</b> Gold 9442
+      25 seats · RM 84
+
+      <b>08:40</b> Plat 9524
+      42 seats · RM 113
     """
     lines: list[str] = [
-        "🚂 <b>KTMB seats available</b>",
+        "🚂 <b>KTMB seats</b>",
         f"Pax: {cfg.passenger_count}",
     ]
 
@@ -589,24 +606,23 @@ def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
             )
             lines.append("")
             lines.append(f"{tag} · <b>{_html_escape(_pretty_date(day))}</b>")
-            lines.append(route)
+            lines.append(f"<i>{route}</i>")
 
-            # Monospace block keeps columns readable on mobile
-            table_lines: list[str] = []
             for t in trips:
-                # Fixed-ish columns: time, service+no, seats, fare
-                left = f"{t.depart}–{t.arrive}"
-                mid = f"{t.service} {t.train_no}"
-                seats = f"{t.seats} seat"
-                if t.seats != 1:
-                    seats += "s"
-                fare = f"RM {t.fare}"
-                # Pad mid for rough alignment inside <pre>
-                table_lines.append(
-                    f"{left}  {mid:<18}  {seats:>9}  {fare}"
+                svc = _html_escape(_short_service(t.service))
+                train = _html_escape(t.train_no)
+                # Drop .00 on whole-ringgit fares: 84.00 → 84
+                fare = t.fare
+                if fare.endswith(".00"):
+                    fare = fare[:-3]
+                fare = _html_escape(fare)
+                seats_word = "seat" if t.seats == 1 else "seats"
+                lines.append("")
+                lines.append(
+                    f"<b>{_html_escape(t.depart)}</b>–"
+                    f"{_html_escape(t.arrive)} · {svc} {train}"
                 )
-            block = _html_escape("\n".join(table_lines))
-            lines.append(f"<pre>{block}</pre>")
+                lines.append(f"{t.seats} {seats_word} · RM {fare}")
 
     lines += ["", f'<a href="{BASE}">Book on KTMB</a>']
     return "\n".join(lines)

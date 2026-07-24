@@ -484,21 +484,53 @@ def send_telegram(cfg: Config, text: str) -> None:
         print(text)
         return
 
+    # Telegram hard limit is 4096 characters per message.
+    chunks: list[str] = []
+    if len(text) <= 4000:
+        chunks = [text]
+    else:
+        lines = text.split("\n")
+        buf: list[str] = []
+        size = 0
+        for line in lines:
+            add = len(line) + (1 if buf else 0)
+            if buf and size + add > 3900:
+                chunks.append("\n".join(buf))
+                buf = [line]
+                size = len(line)
+            else:
+                buf.append(line)
+                size += add
+        if buf:
+            chunks.append("\n".join(buf))
+
     url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
-    body = urllib.parse.urlencode(
-        {
-            "chat_id": cfg.telegram_chat_id,
-            "text": text,
-            "disable_web_page_preview": "true",
-        }
-    ).encode()
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", "replace")
-    data = json.loads(raw)
-    if not data.get("ok"):
-        raise RuntimeError("Telegram send failed")
+    for chunk in chunks:
+        body = urllib.parse.urlencode(
+            {
+                "chat_id": cfg.telegram_chat_id,
+                "text": chunk,
+                "disable_web_page_preview": "true",
+            }
+        ).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", "replace")
+            desc = ""
+            try:
+                desc = str(json.loads(err_body).get("description") or "")
+            except json.JSONDecodeError:
+                desc = err_body[:200]
+            # Never log token/chat id; description is safe (e.g. "chat not found").
+            raise RuntimeError(f"Telegram HTTP {e.code}: {desc}") from e
+        data = json.loads(raw)
+        if not data.get("ok"):
+            desc = str(data.get("description") or "unknown")
+            raise RuntimeError(f"Telegram API error: {desc}")
 
 
 def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
@@ -641,7 +673,7 @@ def main() -> int:
             send_telegram(cfg, msg)
             print("telegram=sent")
         except Exception as e:
-            print(f"telegram error: {type(e).__name__}", file=sys.stderr)
+            print(f"telegram error: {e}", file=sys.stderr)
             return 1
         alerted |= new_keys
 

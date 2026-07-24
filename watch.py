@@ -553,19 +553,22 @@ def _pretty_date(iso: str) -> str:
 
 def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
     """
-    Previous sectioned layout, phone-friendly:
+    Monospace <pre> blocks (Telegram green code box) with:
+      line 1: time + class + train no
+      line 2: seats + price
+      blank line between trains
 
+    Example:
       🚂 KTMB seats available
       Pax: 1
 
       ➡️ OUT · 9 Aug 2026
       JB SENTRAL → KL SENTRAL
-
-      07:35–12:11  Gold 9442
+      <pre>07:35–12:11  Gold 9442
       25 seats · RM 84
 
       08:40–13:00  Platinum 9524
-      42 seats · RM 113
+      42 seats · RM 113</pre>
     """
     lines: list[str] = [
         "🚂 <b>KTMB seats available</b>",
@@ -594,21 +597,20 @@ def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
             lines.append(f"{tag} · <b>{_html_escape(_pretty_date(day))}</b>")
             lines.append(route)
 
+            # Build monospace block — short lines so phones don't wrap mid-field
+            blocks: list[str] = []
             for t in trips:
-                svc = _html_escape(t.service)
-                train = _html_escape(t.train_no)
                 fare = t.fare
                 if fare.endswith(".00"):
                     fare = fare[:-3]
-                fare = _html_escape(fare)
                 seats_word = "seat" if t.seats == 1 else "seats"
-                # Blank line before each train block for spacing
-                lines.append("")
-                lines.append(
-                    f"<b>{_html_escape(t.depart)}–{_html_escape(t.arrive)}</b>"
-                    f"  {svc} {train}"
+                blocks.append(
+                    f"{t.depart}–{t.arrive}  {t.service} {t.train_no}\n"
+                    f"{t.seats} {seats_word} · RM {fare}"
                 )
-                lines.append(f"{t.seats} {seats_word} · RM {fare}")
+            # Blank line between trains inside the pre block
+            pre_body = _html_escape("\n\n".join(blocks))
+            lines.append(f"<pre>{pre_body}</pre>")
 
     lines += ["", f'<a href="{BASE}">Book on KTMB</a>']
     return "\n".join(lines)

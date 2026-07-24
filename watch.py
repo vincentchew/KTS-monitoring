@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""
+KTMB ticket availability watcher.
+
+Reads trip criteria from environment (GitHub Actions secrets).
+Polls online.ktmb.com.my and notifies Telegram when matching seats appear.
+
+Does not log route, dates, or other trip details (public workflow logs).
+"""
+
+from __future__ import annotations
+
+import html as htmlmod
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from http.cookiejar import CookieJar
+from pathlib import Path
+from typing import Iterable
+
+BASE = "https://online.ktmb.com.my"
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+STATE_PATH = Path(os.environ.get("STATE_PATH", ".state/alerted.json"))
+
+
+@dataclass(frozen=True)
+class Trip:
+    date: str  # YYYY-MM-DD
+    service: str
+    train_no: str
+    depart: str  # HH:MM
+    arrive: str
+    duration: str
+    seats: int
+    fare: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.date}|{self.train_no}|{self.depart}"
+
+
+@dataclass
+class Config:
+    from_station: str
+    to_station: str
+    watch_dates: list[date]
+    time_start: int | None  # minutes from midnight
+    time_end: int | None
+    passenger_count: int
+    telegram_token: str
+    telegram_chat_id: str
+    dry_run: bool
+
+
+class KtmbClient:
+    def __init__(self) -> None:
+        self.cj = CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cj)
+        )
+        self.opener.addheaders = [
+            ("User-Agent", UA),
+            ("Accept-Language", "en-MY,en;q=0.9"),
+        ]
+
+    def _read(self, resp: object) -> str:
+        return resp.read().decode("utf-8", "replace")  # type: ignore[attr-defined]
+
+    def get(self, url: str) -> str:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with self.opener.open(req, timeout=45) as resp:
+            return self._read(resp)
+
+    def post_form(self, url: str, data: dict, referer: str) -> str:
+        body = urllib.parse.urlencode(data).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        req.add_header("Referer", referer)
+        req.add_header("Origin", BASE)
+        req.add_header("User-Agent", UA)
+        with self.opener.open(req, timeout=45) as resp:
+            return self._read(resp)
+
+    def post_json(self, url: str, payload: dict, csrf: str, referer: str) -> dict:
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        req.add_header("RequestVerificationToken", csrf)
+        req.add_header("Referer", referer)
+        req.add_header("Origin", BASE)
+        req.add_header("X-Requested-With", "XMLHttpRequest")
+        req.add_header("Accept", "application/json, text/javascript, */*; q=0.01")
+        req.add_header("User-Agent", UA)
+        try:
+            with self.opener.open(req, timeout=45) as resp:
+                raw = self._read(resp)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            raise RuntimeError(f"HTTP {e.code} from KTMB") from e
+        return json.loads(raw)
+
+
+def _hidden(page: str, field_id: str) -> str | None:
+    m = re.search(
+        rf'<input[^>]+id="{re.escape(field_id)}"[^>]*value="([^"]*)"',
+        page,
+        re.I,
+    )
+    if not m:
+        return None
+    return htmlmod.unescape(m.group(1))
+
+
+def _csrf(page: str) -> str:
+    m = re.search(
+        r'name="__RequestVerificationToken"[^>]*value="([^"]+)"',
+        page,
+    )
+    if not m:
+        raise RuntimeError("CSRF token not found")
+    return m.group(1)
+
+
+def resolve_station(home_html: str, stations: list[dict], query: str) -> tuple[str, str]:
+    """Return (station_id, station_data) for id or name."""
+    q = query.strip()
+    by_id = {s["Id"]: s for s in stations}
+    if q in by_id:
+        return q, by_id[q]["StationData"]
+
+    # Map visible names from <option> tags
+    name_to_id: dict[str, str] = {}
+    for m in re.finditer(
+        r'<option value="([^"]+)"[^>]*>([^<]+)</option>',
+        home_html,
+        re.I,
+    ):
+        sid, name = m.group(1), m.group(2).strip()
+        if not sid or not name or name.lower().startswith("select"):
+            continue
+        name_to_id[name.upper()] = sid
+        name_to_id[re.sub(r"\s+", " ", name.upper())] = sid
+
+    key = re.sub(r"\s+", " ", q.upper())
+    if key in name_to_id:
+        sid = name_to_id[key]
+        return sid, by_id[sid]["StationData"]
+
+    # Fuzzy: unique substring match
+    hits = [n for n in name_to_id if key in n or n in key]
+    # dedupe by id
+    ids = list({name_to_id[n] for n in hits})
+    if len(ids) == 1:
+        sid = ids[0]
+        return sid, by_id[sid]["StationData"]
+
+    raise RuntimeError("Station not found or ambiguous")
+
+
+def parse_dates(raw: str) -> list[date]:
+    """
+    WATCH_DATES formats:
+      2026-08-15
+      2026-08-15,2026-08-16
+      2026-08-15..2026-08-18
+    """
+    if not raw or not raw.strip():
+        raise RuntimeError("WATCH_DATES is required")
+
+    out: list[date] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ".." in part:
+            a, b = [x.strip() for x in part.split("..", 1)]
+            start = date.fromisoformat(a)
+            end = date.fromisoformat(b)
+            if end < start:
+                raise RuntimeError("WATCH_DATES range end before start")
+            cur = start
+            while cur <= end:
+                out.append(cur)
+                cur += timedelta(days=1)
+        else:
+            out.append(date.fromisoformat(part))
+
+    # unique preserve order
+    seen: set[date] = set()
+    uniq: list[date] = []
+    for d in out:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    if not uniq:
+        raise RuntimeError("WATCH_DATES parsed empty")
+    return uniq
+
+
+def parse_time_filter(raw: str | None) -> tuple[int | None, int | None]:
+    """
+    TIME_FILTER:
+      empty / * / any  → no filter
+      06:00-12:00      → inclusive window on departure time
+      6:00-12:00
+    """
+    if raw is None:
+        return None, None
+    s = raw.strip().lower()
+    if not s or s in {"*", "any", "all", "-"}:
+        return None, None
+
+    m = re.fullmatch(
+        r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})",
+        s,
+    )
+    if not m:
+        raise RuntimeError("TIME_FILTER must look like HH:MM-HH:MM or be empty")
+
+    def mins(h: str, mi: str) -> int:
+        hh, mm = int(h), int(mi)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise RuntimeError("TIME_FILTER out of range")
+        return hh * 60 + mm
+
+    start = mins(m.group(1), m.group(2))
+    end = mins(m.group(3), m.group(4))
+    return start, end
+
+
+def time_to_mins(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def load_config() -> Config:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    dry = os.environ.get("DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
+
+    if not dry and (not token or not chat):
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required")
+
+    pax_raw = os.environ.get("PASSENGER_COUNT", "1").strip() or "1"
+    pax = int(pax_raw)
+    if pax < 1 or pax > 99:
+        raise RuntimeError("PASSENGER_COUNT must be 1-99")
+
+    t0, t1 = parse_time_filter(os.environ.get("TIME_FILTER"))
+
+    return Config(
+        from_station=os.environ.get("FROM_STATION", "").strip(),
+        to_station=os.environ.get("TO_STATION", "").strip(),
+        watch_dates=parse_dates(os.environ.get("WATCH_DATES", "")),
+        time_start=t0,
+        time_end=t1,
+        passenger_count=pax,
+        telegram_token=token,
+        telegram_chat_id=chat,
+        dry_run=dry,
+    )
+
+
+def form_date(d: date) -> str:
+    """KTMB lightpick format: D MMM YYYY (e.g. 7 Aug 2026)."""
+    return f"{d.day} {d.strftime('%b')} {d.year}"
+
+
+def parse_trips_html(trip_html: str, day: date) -> list[Trip]:
+    """Parse trip table rows from /Trip/Trip HTML fragment."""
+    trips: list[Trip] = []
+    day_s = day.isoformat()
+
+    # Row text example:
+    # Gold - 9442 07:35 12:11 4h 36m 4 MYR 86.00 Login to view
+    # Platinum - 9535 20:00 00:20 +1 4h 20m 280 MYR 115.00 Login to view
+    row_re = re.compile(
+        r"(?P<service>[A-Za-z][A-Za-z0-9 /+-]*?)\s*-\s*"
+        r"(?P<train>\d+)\s+"
+        r"(?P<dep>\d{1,2}:\d{2})\s+"
+        r"(?P<arr>\d{1,2}:\d{2})"
+        r"(?:\s*\+1)?\s+"
+        r"(?P<dur>\d+h\s*\d+m)\s+"
+        r"(?P<seats>\d+)\s+"
+        r"MYR\s*(?P<fare>[0-9.]+)",
+        re.I,
+    )
+
+    for row in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", trip_html, re.I):
+        text = " ".join(re.sub(r"<[^>]+>", " ", row).split())
+        m = row_re.search(text)
+        if not m:
+            continue
+        dep = m.group("dep")
+        # normalize H:MM -> HH:MM
+        dh, dm = dep.split(":")
+        dep = f"{int(dh):02d}:{dm}"
+        ah, am = m.group("arr").split(":")
+        arr = f"{int(ah):02d}:{am}"
+        trips.append(
+            Trip(
+                date=day_s,
+                service=m.group("service").strip(),
+                train_no=m.group("train"),
+                depart=dep,
+                arrive=arr,
+                duration=re.sub(r"\s+", " ", m.group("dur").strip()),
+                seats=int(m.group("seats")),
+                fare=m.group("fare"),
+            )
+        )
+    return trips
+
+
+def fetch_trips_for_date(
+    client: KtmbClient,
+    from_id: str,
+    from_data: str,
+    to_id: str,
+    to_data: str,
+    day: date,
+    pax: int,
+) -> list[Trip]:
+    home = client.get(f"{BASE}/Home/Index")
+    csrf = _csrf(home)
+
+    trip_page = client.post_form(
+        f"{BASE}/Trip",
+        {
+            "FromStationData": from_data,
+            "ToStationData": to_data,
+            "FromStationId": from_id,
+            "ToStationId": to_id,
+            "OnwardDate": form_date(day),
+            "ReturnDate": "",
+            "PassengerCount": str(pax),
+            "__RequestVerificationToken": csrf,
+        },
+        f"{BASE}/Home/Index",
+    )
+
+    csrf2 = _csrf(trip_page)
+    get_token_url = _hidden(trip_page, "GetTripTokenUrl")
+    trip_url = _hidden(trip_page, "TripTripUrl")
+    search_data = _hidden(trip_page, "SearchData")
+    form_code = _hidden(trip_page, "FormValidationCode")
+    if not all([get_token_url, trip_url, search_data, form_code]):
+        raise RuntimeError("Trip page missing expected fields")
+
+    # Absolute URLs
+    if get_token_url.startswith("/"):
+        get_token_url = BASE + get_token_url
+    if trip_url.startswith("/"):
+        trip_url = BASE + trip_url
+
+    token_resp = client.post_json(
+        get_token_url,
+        {"FormToken": form_code},
+        csrf2,
+        f"{BASE}/Trip",
+    )
+    form_token = token_resp.get("formToken")
+    if not form_token:
+        raise RuntimeError("GetTripToken failed")
+
+    # Site init: RenderTrip(..., false, 1) — sequence 1 = depart leg
+    trip_resp = client.post_json(
+        trip_url,
+        {
+            "SearchData": search_data,
+            "FormValidationCode": form_token,
+            "DepartDate": day.isoformat(),
+            "IsReturn": False,
+            "BookingTripSequenceNo": 1,
+        },
+        csrf2,
+        f"{BASE}/Trip",
+    )
+    if not trip_resp.get("status"):
+        msgs = trip_resp.get("messages") or [trip_resp.get("data") or "unknown"]
+        raise RuntimeError(f"Trip lookup failed: {msgs}")
+
+    html_frag = trip_resp.get("data") or ""
+    return parse_trips_html(html_frag, day)
+
+
+def filter_trips(trips: Iterable[Trip], cfg: Config) -> list[Trip]:
+    out: list[Trip] = []
+    for t in trips:
+        if t.seats < cfg.passenger_count:
+            continue
+        mins = time_to_mins(t.depart)
+        if cfg.time_start is not None and mins < cfg.time_start:
+            continue
+        if cfg.time_end is not None and mins > cfg.time_end:
+            continue
+        out.append(t)
+    return out
+
+
+def load_alerted() -> set[str]:
+    if not STATE_PATH.exists():
+        return set()
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return set(data.get("alerted") or [])
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def save_alerted(keys: set[str]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(
+        json.dumps({"alerted": sorted(keys)}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def send_telegram(cfg: Config, text: str) -> None:
+    if cfg.dry_run:
+        # Keep dry-run output free of secrets; message body is intentional for local debug.
+        print("DRY_RUN telegram message:")
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
+    body = urllib.parse.urlencode(
+        {
+            "chat_id": cfg.telegram_chat_id,
+            "text": text,
+            "disable_web_page_preview": "true",
+        }
+    ).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    data = json.loads(raw)
+    if not data.get("ok"):
+        raise RuntimeError("Telegram send failed")
+
+
+def format_alert(
+    cfg: Config,
+    from_label: str,
+    to_label: str,
+    new_trips: list[Trip],
+) -> str:
+    lines = [
+        "KTMB seats available",
+        f"{from_label} → {to_label}",
+        f"Passengers: {cfg.passenger_count}",
+        "",
+    ]
+    for t in new_trips:
+        lines.append(
+            f"• {t.date}  {t.depart}–{t.arrive}  "
+            f"{t.service} {t.train_no}  "
+            f"{t.seats} seat(s)  MYR {t.fare}"
+        )
+    lines += ["", BASE]
+    return "\n".join(lines)
+
+
+def station_label(home_html: str, station_id: str, fallback: str) -> str:
+    for m in re.finditer(
+        rf'<option value="{re.escape(station_id)}"[^>]*>([^<]+)</option>',
+        home_html,
+        re.I,
+    ):
+        return m.group(1).strip()
+    return fallback
+
+
+def main() -> int:
+    try:
+        cfg = load_config()
+    except Exception as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+
+    if not cfg.from_station or not cfg.to_station:
+        print("config error: FROM_STATION and TO_STATION are required", file=sys.stderr)
+        return 2
+
+    client = KtmbClient()
+    try:
+        home = client.get(f"{BASE}/Home/Index")
+        stations = json.loads(
+            re.search(r"var jsStations = (\[.*?\]);", home, re.S).group(1)
+        )
+        from_id, from_data = resolve_station(home, stations, cfg.from_station)
+        to_id, to_data = resolve_station(home, stations, cfg.to_station)
+        from_label = station_label(home, from_id, cfg.from_station)
+        to_label = station_label(home, to_id, cfg.to_station)
+    except Exception as e:
+        print(f"init error: {e}", file=sys.stderr)
+        return 1
+
+    all_matches: list[Trip] = []
+    errors = 0
+    for day in cfg.watch_dates:
+        try:
+            # Refresh station tokens periodically via new home/trip each date
+            home = client.get(f"{BASE}/Home/Index")
+            stations = json.loads(
+                re.search(r"var jsStations = (\[.*?\]);", home, re.S).group(1)
+            )
+            from_id, from_data = resolve_station(home, stations, cfg.from_station)
+            to_id, to_data = resolve_station(home, stations, cfg.to_station)
+            trips = fetch_trips_for_date(
+                client,
+                from_id,
+                from_data,
+                to_id,
+                to_data,
+                day,
+                cfg.passenger_count,
+            )
+            all_matches.extend(filter_trips(trips, cfg))
+        except Exception as e:
+            errors += 1
+            print(f"poll error on one date: {type(e).__name__}", file=sys.stderr)
+
+    current_keys = {t.key for t in all_matches}
+    alerted = load_alerted()
+    # Drop keys that are no longer available so they can re-alert later
+    alerted &= current_keys
+    new_keys = current_keys - alerted
+    new_trips = [t for t in all_matches if t.key in new_keys]
+    # stable order
+    new_trips.sort(key=lambda t: (t.date, t.depart, t.train_no))
+
+    print(
+        f"checked_dates={len(cfg.watch_dates)} "
+        f"matches={len(all_matches)} "
+        f"new={len(new_trips)} "
+        f"errors={errors}"
+    )
+
+    if new_trips:
+        msg = format_alert(cfg, from_label, to_label, new_trips)
+        try:
+            send_telegram(cfg, msg)
+            print("telegram=sent")
+        except Exception as e:
+            print(f"telegram error: {type(e).__name__}", file=sys.stderr)
+            return 1
+        alerted |= new_keys
+
+    save_alerted(alerted)
+
+    # Non-zero if every date failed
+    if errors and errors == len(cfg.watch_dates):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

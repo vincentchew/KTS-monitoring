@@ -1,0 +1,47 @@
+name: watch
+
+on:
+  schedule:
+    # Every 15 minutes (UTC). GitHub does not guarantee exact timing.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kts-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore alert state
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: alert-state-${{ github.run_id }}
+          restore-keys: |
+            alert-state-
+
+      - name: Run watcher
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FROM_STATION: ${{ secrets.FROM_STATION }}
+          TO_STATION: ${{ secrets.TO_STATION }}
+          WATCH_DATES: ${{ secrets.WATCH_DATES }}
+          TIME_FILTER: ${{ secrets.TIME_FILTER }}
+          PASSENGER_COUNT: ${{ secrets.PASSENGER_COUNT }}
+          STATE_PATH: .state/alerted.json
+        run: python3 watch.py

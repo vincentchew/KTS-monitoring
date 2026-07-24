@@ -35,6 +35,9 @@ STATE_PATH = Path(os.environ.get("STATE_PATH", ".state/alerted.json"))
 
 @dataclass(frozen=True)
 class Trip:
+    leg: str  # "outbound" | "return"
+    from_label: str
+    to_label: str
     date: str  # YYYY-MM-DD
     service: str
     train_no: str
@@ -46,16 +49,19 @@ class Trip:
 
     @property
     def key(self) -> str:
-        return f"{self.date}|{self.train_no}|{self.depart}"
+        return f"{self.leg}|{self.date}|{self.train_no}|{self.depart}"
 
 
 @dataclass
 class Config:
     from_station: str
     to_station: str
-    watch_dates: list[date]
-    time_start: int | None  # minutes from midnight
+    watch_dates: list[date]  # outbound: FROM → TO
+    return_dates: list[date]  # return: TO → FROM (optional)
+    time_start: int | None  # minutes from midnight (outbound)
     time_end: int | None
+    return_time_start: int | None
+    return_time_end: int | None
     passenger_count: int
     telegram_token: str
     telegram_chat_id: str
@@ -167,18 +173,20 @@ def resolve_station(home_html: str, stations: list[dict], query: str) -> tuple[s
     raise RuntimeError("Station not found or ambiguous")
 
 
-def parse_dates(raw: str) -> list[date]:
+def parse_dates(raw: str, *, required: bool, label: str) -> list[date]:
     """
-    WATCH_DATES formats:
+    Date list formats:
       2026-08-15
       2026-08-15,2026-08-16
       2026-08-15..2026-08-18
     """
-    if not raw or not raw.strip():
-        raise RuntimeError("WATCH_DATES is required")
+    if raw is None or not str(raw).strip():
+        if required:
+            raise RuntimeError(f"{label} is required")
+        return []
 
     out: list[date] = []
-    for part in raw.split(","):
+    for part in str(raw).split(","):
         part = part.strip()
         if not part:
             continue
@@ -187,7 +195,7 @@ def parse_dates(raw: str) -> list[date]:
             start = date.fromisoformat(a)
             end = date.fromisoformat(b)
             if end < start:
-                raise RuntimeError("WATCH_DATES range end before start")
+                raise RuntimeError(f"{label} range end before start")
             cur = start
             while cur <= end:
                 out.append(cur)
@@ -202,8 +210,8 @@ def parse_dates(raw: str) -> list[date]:
         if d not in seen:
             seen.add(d)
             uniq.append(d)
-    if not uniq:
-        raise RuntimeError("WATCH_DATES parsed empty")
+    if required and not uniq:
+        raise RuntimeError(f"{label} parsed empty")
     return uniq
 
 
@@ -257,13 +265,30 @@ def load_config() -> Config:
         raise RuntimeError("PASSENGER_COUNT must be 1-99")
 
     t0, t1 = parse_time_filter(os.environ.get("TIME_FILTER"))
+    # Optional separate window for return; falls back to TIME_FILTER
+    ret_filter_raw = os.environ.get("RETURN_TIME_FILTER")
+    if ret_filter_raw is None or not str(ret_filter_raw).strip():
+        rt0, rt1 = t0, t1
+    else:
+        rt0, rt1 = parse_time_filter(ret_filter_raw)
 
     return Config(
         from_station=os.environ.get("FROM_STATION", "").strip(),
         to_station=os.environ.get("TO_STATION", "").strip(),
-        watch_dates=parse_dates(os.environ.get("WATCH_DATES", "")),
+        watch_dates=parse_dates(
+            os.environ.get("WATCH_DATES", ""),
+            required=True,
+            label="WATCH_DATES",
+        ),
+        return_dates=parse_dates(
+            os.environ.get("RETURN_DATES", ""),
+            required=False,
+            label="RETURN_DATES",
+        ),
         time_start=t0,
         time_end=t1,
+        return_time_start=rt0,
+        return_time_end=rt1,
         passenger_count=pax,
         telegram_token=token,
         telegram_chat_id=chat,
@@ -276,7 +301,14 @@ def form_date(d: date) -> str:
     return f"{d.day} {d.strftime('%b')} {d.year}"
 
 
-def parse_trips_html(trip_html: str, day: date) -> list[Trip]:
+def parse_trips_html(
+    trip_html: str,
+    day: date,
+    *,
+    leg: str,
+    from_label: str,
+    to_label: str,
+) -> list[Trip]:
     """Parse trip table rows from /Trip/Trip HTML fragment."""
     trips: list[Trip] = []
     day_s = day.isoformat()
@@ -309,6 +341,9 @@ def parse_trips_html(trip_html: str, day: date) -> list[Trip]:
         arr = f"{int(ah):02d}:{am}"
         trips.append(
             Trip(
+                leg=leg,
+                from_label=from_label,
+                to_label=to_label,
                 date=day_s,
                 service=m.group("service").strip(),
                 train_no=m.group("train"),
@@ -330,6 +365,10 @@ def fetch_trips_for_date(
     to_data: str,
     day: date,
     pax: int,
+    *,
+    leg: str,
+    from_label: str,
+    to_label: str,
 ) -> list[Trip]:
     home = client.get(f"{BASE}/Home/Index")
     csrf = _csrf(home)
@@ -391,18 +430,30 @@ def fetch_trips_for_date(
         raise RuntimeError(f"Trip lookup failed: {msgs}")
 
     html_frag = trip_resp.get("data") or ""
-    return parse_trips_html(html_frag, day)
+    return parse_trips_html(
+        html_frag,
+        day,
+        leg=leg,
+        from_label=from_label,
+        to_label=to_label,
+    )
 
 
-def filter_trips(trips: Iterable[Trip], cfg: Config) -> list[Trip]:
+def filter_trips(
+    trips: Iterable[Trip],
+    *,
+    passenger_count: int,
+    time_start: int | None,
+    time_end: int | None,
+) -> list[Trip]:
     out: list[Trip] = []
     for t in trips:
-        if t.seats < cfg.passenger_count:
+        if t.seats < passenger_count:
             continue
         mins = time_to_mins(t.depart)
-        if cfg.time_start is not None and mins < cfg.time_start:
+        if time_start is not None and mins < time_start:
             continue
-        if cfg.time_end is not None and mins > cfg.time_end:
+        if time_end is not None and mins > time_end:
             continue
         out.append(t)
     return out
@@ -450,21 +501,17 @@ def send_telegram(cfg: Config, text: str) -> None:
         raise RuntimeError("Telegram send failed")
 
 
-def format_alert(
-    cfg: Config,
-    from_label: str,
-    to_label: str,
-    new_trips: list[Trip],
-) -> str:
+def format_alert(cfg: Config, new_trips: list[Trip]) -> str:
     lines = [
         "KTMB seats available",
-        f"{from_label} → {to_label}",
         f"Passengers: {cfg.passenger_count}",
         "",
     ]
     for t in new_trips:
+        tag = "OUT" if t.leg == "outbound" else "RET"
         lines.append(
-            f"• {t.date}  {t.depart}–{t.arrive}  "
+            f"• [{tag}] {t.from_label} → {t.to_label}\n"
+            f"  {t.date}  {t.depart}–{t.arrive}  "
             f"{t.service} {t.train_no}  "
             f"{t.seats} seat(s)  MYR {t.fare}"
         )
@@ -499,38 +546,77 @@ def main() -> int:
         stations = json.loads(
             re.search(r"var jsStations = (\[.*?\]);", home, re.S).group(1)
         )
-        from_id, from_data = resolve_station(home, stations, cfg.from_station)
-        to_id, to_data = resolve_station(home, stations, cfg.to_station)
+        from_id, _from_data = resolve_station(home, stations, cfg.from_station)
+        to_id, _to_data = resolve_station(home, stations, cfg.to_station)
         from_label = station_label(home, from_id, cfg.from_station)
         to_label = station_label(home, to_id, cfg.to_station)
     except Exception as e:
         print(f"init error: {e}", file=sys.stderr)
         return 1
 
+    # Each job: (leg, origin query, dest query, origin label, dest label, dates, time window)
+    jobs: list[tuple[str, str, str, str, str, list[date], int | None, int | None]] = [
+        (
+            "outbound",
+            cfg.from_station,
+            cfg.to_station,
+            from_label,
+            to_label,
+            cfg.watch_dates,
+            cfg.time_start,
+            cfg.time_end,
+        ),
+    ]
+    if cfg.return_dates:
+        jobs.append(
+            (
+                "return",
+                cfg.to_station,  # stations swapped
+                cfg.from_station,
+                to_label,
+                from_label,
+                cfg.return_dates,
+                cfg.return_time_start,
+                cfg.return_time_end,
+            )
+        )
+
     all_matches: list[Trip] = []
     errors = 0
-    for day in cfg.watch_dates:
-        try:
-            # Refresh station tokens periodically via new home/trip each date
-            home = client.get(f"{BASE}/Home/Index")
-            stations = json.loads(
-                re.search(r"var jsStations = (\[.*?\]);", home, re.S).group(1)
-            )
-            from_id, from_data = resolve_station(home, stations, cfg.from_station)
-            to_id, to_data = resolve_station(home, stations, cfg.to_station)
-            trips = fetch_trips_for_date(
-                client,
-                from_id,
-                from_data,
-                to_id,
-                to_data,
-                day,
-                cfg.passenger_count,
-            )
-            all_matches.extend(filter_trips(trips, cfg))
-        except Exception as e:
-            errors += 1
-            print(f"poll error on one date: {type(e).__name__}", file=sys.stderr)
+    checks = 0
+    for leg, origin_q, dest_q, o_label, d_label, days, t0, t1 in jobs:
+        for day in days:
+            checks += 1
+            try:
+                home = client.get(f"{BASE}/Home/Index")
+                stations = json.loads(
+                    re.search(r"var jsStations = (\[.*?\]);", home, re.S).group(1)
+                )
+                o_id, o_data = resolve_station(home, stations, origin_q)
+                d_id, d_data = resolve_station(home, stations, dest_q)
+                trips = fetch_trips_for_date(
+                    client,
+                    o_id,
+                    o_data,
+                    d_id,
+                    d_data,
+                    day,
+                    cfg.passenger_count,
+                    leg=leg,
+                    from_label=o_label,
+                    to_label=d_label,
+                )
+                all_matches.extend(
+                    filter_trips(
+                        trips,
+                        passenger_count=cfg.passenger_count,
+                        time_start=t0,
+                        time_end=t1,
+                    )
+                )
+            except Exception:
+                errors += 1
+                print(f"poll error on one leg/date: {leg}", file=sys.stderr)
 
     current_keys = {t.key for t in all_matches}
     alerted = load_alerted()
@@ -538,18 +624,19 @@ def main() -> int:
     alerted &= current_keys
     new_keys = current_keys - alerted
     new_trips = [t for t in all_matches if t.key in new_keys]
-    # stable order
-    new_trips.sort(key=lambda t: (t.date, t.depart, t.train_no))
+    new_trips.sort(key=lambda t: (t.leg != "outbound", t.date, t.depart, t.train_no))
 
     print(
-        f"checked_dates={len(cfg.watch_dates)} "
+        f"checked={checks} "
+        f"outbound_dates={len(cfg.watch_dates)} "
+        f"return_dates={len(cfg.return_dates)} "
         f"matches={len(all_matches)} "
         f"new={len(new_trips)} "
         f"errors={errors}"
     )
 
     if new_trips:
-        msg = format_alert(cfg, from_label, to_label, new_trips)
+        msg = format_alert(cfg, new_trips)
         try:
             send_telegram(cfg, msg)
             print("telegram=sent")
@@ -560,8 +647,7 @@ def main() -> int:
 
     save_alerted(alerted)
 
-    # Non-zero if every date failed
-    if errors and errors == len(cfg.watch_dates):
+    if checks and errors == checks:
         return 1
     return 0
 

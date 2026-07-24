@@ -41,7 +41,9 @@ jobs:
           FROM_STATION: ${{ secrets.FROM_STATION }}
           TO_STATION: ${{ secrets.TO_STATION }}
           WATCH_DATES: ${{ secrets.WATCH_DATES }}
+          RETURN_DATES: ${{ secrets.RETURN_DATES }}
           TIME_FILTER: ${{ secrets.TIME_FILTER }}
+          RETURN_TIME_FILTER: ${{ secrets.RETURN_TIME_FILTER }}
           PASSENGER_COUNT: ${{ secrets.PASSENGER_COUNT }}
           STATE_PATH: .state/alerted.json
         run: python3 watch.py
